@@ -25,7 +25,7 @@ Optimized for workloads with many small files (50–300KB). Configuration via en
    - For non-AWS endpoints, set `S3_ENDPOINT` (e.g. `https://play.min.io:9000`).
 3. Run:
    ```
-   go run ./cmd/webdav-s3
+   go run .
    ```
 4. Mount from a WebDAV client (macOS Finder, Windows, rclone, etc.) at:
    - URL: `http://localhost:8080/`
