@@ -53,24 +53,28 @@ func (f *FS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 
 func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
 	key := normalizeKey(name)
+
 	// Disallow append: Not supported efficiently on S3
 	if flag&os.O_APPEND != 0 {
 		return nil, toPathError("open", name, fmt.Errorf("append not supported"))
 	}
-	// If path ends with '/', treat it as a directory path for reads,
-	// but disallow writes to directories.
-	if strings.HasSuffix(key, "/") && (flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0) {
+
+	// Remember if the request explicitly addressed a directory (trailing slash)
+	hadSlash := strings.HasSuffix(key, "/")
+
+	// Disallow writes to directory paths
+	if hadSlash && (flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0) {
 		return nil, toPathError("open", name, os.ErrInvalid)
 	}
-	// Normalize directory suffix away for further checks
-	key = strings.TrimSuffix(key, "/")
+
+	// Normalize directory suffix away for internal checks
+	trimKey := strings.TrimSuffix(key, "/")
 
 	// If writable requested -> create a write-only handle (buffered)
 	if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
-		// For RDWR we only support write path (data is fully re-uploaded on Close)
 		w := &s3File{
 			fs:       f,
-			key:      key,
+			key:      trimKey,
 			writable: true,
 			buf:      bytes.NewBuffer(nil),
 			bufLimit: f.opts.UploadBufferLimit,
@@ -80,17 +84,36 @@ func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMo
 
 	// Read-only open
 	// Root directory always exists -> return directory handle
-	if key == "" {
+	if trimKey == "" {
 		return &s3Dir{fs: f, key: ""}, nil
 	}
 
-	// Try open as an object (file)
-	obj, err := f.cli.GetObject(ctx, f.bkt, key, minio.GetObjectOptions{})
+	// If the path explicitly ends with '/', treat it strictly as a directory,
+	// and do not attempt to open an object with the same name.
+	if hadSlash {
+		dirMarker := trimKey + "/"
+		if _, derr := f.cli.StatObject(ctx, f.bkt, dirMarker, minio.StatObjectOptions{}); derr == nil {
+			return &s3Dir{fs: f, key: trimKey}, nil
+		}
+		for o := range f.cli.ListObjects(ctx, f.bkt, minio.ListObjectsOptions{
+			Prefix:    dirMarker,
+			Recursive: false,
+		}) {
+			if o.Err != nil {
+				return nil, toPathError("open", name, o.Err)
+			}
+			return &s3Dir{fs: f, key: trimKey}, nil
+		}
+		return nil, toPathError("open", name, os.ErrNotExist)
+	}
+
+	// Try open as an object (file) first for non-slashed paths
+	obj, err := f.cli.GetObject(ctx, f.bkt, trimKey, minio.GetObjectOptions{})
 	if err == nil {
 		if st, statErr := obj.Stat(); statErr == nil {
 			return &s3File{
 				fs:      f,
-				key:     key,
+				key:     trimKey,
 				ro:      obj,
 				size:    st.Size,
 				modTime: st.LastModified,
@@ -102,9 +125,9 @@ func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMo
 
 	// Not a regular object; try to detect a directory:
 	// 1) Check for explicit directory marker "<key>/"
-	dirMarker := key + "/"
+	dirMarker := trimKey + "/"
 	if _, derr := f.cli.StatObject(ctx, f.bkt, dirMarker, minio.StatObjectOptions{}); derr == nil {
-		return &s3Dir{fs: f, key: key}, nil
+		return &s3Dir{fs: f, key: trimKey}, nil
 	}
 	// 2) Look for any object or common prefix under "<key>/" (non-recursive, faster)
 	for o := range f.cli.ListObjects(ctx, f.bkt, minio.ListObjectsOptions{
@@ -115,7 +138,7 @@ func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMo
 			return nil, toPathError("open", name, o.Err)
 		}
 		// Found at least one immediate child or sub-prefix -> it's a directory
-		return &s3Dir{fs: f, key: key}, nil
+		return &s3Dir{fs: f, key: trimKey}, nil
 	}
 
 	// Nothing found
