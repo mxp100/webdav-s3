@@ -55,12 +55,12 @@ func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMo
 	key := normalizeKey(name)
 	// Disallow append: Not supported efficiently on S3
 	if flag&os.O_APPEND != 0 {
-		return nil, fmt.Errorf("append not supported")
+		return nil, toPathError("open", name, fmt.Errorf("append not supported"))
 	}
 	// If path ends with '/', treat it as a directory path for reads,
 	// but disallow writes to directories.
 	if strings.HasSuffix(key, "/") && (flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_TRUNC) != 0) {
-		return nil, os.ErrInvalid
+		return nil, toPathError("open", name, os.ErrInvalid)
 	}
 	// Normalize directory suffix away for further checks
 	key = strings.TrimSuffix(key, "/")
@@ -112,14 +112,14 @@ func (f *FS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMo
 		Recursive: false,
 	}) {
 		if o.Err != nil {
-			return nil, o.Err
+			return nil, toPathError("open", name, o.Err)
 		}
 		// Found at least one immediate child or sub-prefix -> it's a directory
 		return &s3Dir{fs: f, key: key}, nil
 	}
 
 	// Nothing found
-	return nil, os.ErrNotExist
+	return nil, toPathError("open", name, os.ErrNotExist)
 }
 
 func (f *FS) RemoveAll(ctx context.Context, name string) error {
@@ -260,7 +260,7 @@ func (f *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	})
 	for obj := range it {
 		if obj.Err != nil {
-			return nil, obj.Err
+			return nil, toPathError("stat", name, obj.Err)
 		}
 		// Presence of any object under the prefix indicates a directory
 		return &fi{
@@ -272,7 +272,7 @@ func (f *FS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 		}, nil
 	}
 
-	return nil, os.ErrNotExist
+	return nil, toPathError("stat", name, os.ErrNotExist)
 }
 
 func (f *FS) copyThenDelete(ctx context.Context, src, dst string) error {
@@ -410,7 +410,7 @@ func (d *s3Dir) ensureListed() {
 		dirSet := make(map[string]void)
 		fileMap := make(map[string]*fi)
 
-		// Non-recursive listing lets S3/MinIO return immediate children using delimiter="/"
+		// Non-recursive listing; derive immediate children. Treat any "a/b" as directory "a".
 		for obj := range d.fs.cli.ListObjects(ctx, d.fs.bkt, minio.ListObjectsOptions{
 			Prefix:    prefix,
 			Recursive: false,
@@ -424,7 +424,15 @@ func (d *s3Dir) ensureListed() {
 				// folder marker equals to prefix itself
 				continue
 			}
-			// Directories are returned as "name/" entries; files are plain names
+			// If there's a slash in rel, it's under a subdir -> record that subdir as an immediate child
+			if i := strings.IndexByte(rel, '/'); i >= 0 {
+				dirName := rel[:i]
+				if dirName != "" {
+					dirSet[dirName] = void{}
+				}
+				continue
+			}
+			// Explicit folder marker "name/" also indicates a directory
 			if strings.HasSuffix(rel, "/") {
 				dirName := strings.TrimSuffix(rel, "/")
 				if dirName != "" {
@@ -432,6 +440,7 @@ func (d *s3Dir) ensureListed() {
 				}
 				continue
 			}
+			// Immediate file
 			fileMap[rel] = &fi{
 				name: rel,
 				size: obj.Size,
@@ -478,20 +487,30 @@ func (d *s3Dir) Readdir(count int) ([]os.FileInfo, error) {
 		return nil, d.err
 	}
 	remaining := len(d.ents) - d.index
+
+	// n <= 0: return all remaining entries and nil (even if empty)
+	if count <= 0 {
+		if remaining <= 0 {
+			return []os.FileInfo{}, nil
+		}
+		res := d.ents[d.index:]
+		d.index = len(d.ents)
+		return res, nil
+	}
+
+	// n > 0: return up to count; if fewer than requested remain, return io.EOF with the last batch
 	if remaining <= 0 {
-		// End of directory: no more entries
 		return nil, io.EOF
 	}
-	// Choose how many to return:
-	// - count <= 0: return all remaining
-	// - count > 0: return up to 'count'
-	n := remaining
-	if count > 0 && count < remaining {
-		n = count
+	n := count
+	if n > remaining {
+		n = remaining
 	}
 	res := d.ents[d.index : d.index+n]
 	d.index += n
-	// Never return io.EOF together with data; caller will get EOF on the next call when remaining == 0.
+	if n < count {
+		return res, io.EOF
+	}
 	return res, nil
 }
 
